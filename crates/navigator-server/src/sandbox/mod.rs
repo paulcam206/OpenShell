@@ -730,19 +730,154 @@ fn derive_phase(status: &Option<SandboxStatus>, deleting: bool) -> SandboxPhase 
 
 fn is_terminal_failure_condition(condition: &SandboxCondition) -> bool {
     let reason = condition.reason.to_ascii_lowercase();
-    let message = condition.message.to_ascii_lowercase();
-    let haystack = format!("{reason} {message}");
-    let terminal_markers = [
-        "failed",
-        "error",
-        "crashloopbackoff",
-        "imagepullbackoff",
-        "errimagepull",
-        "createcontainerconfigerror",
-        "invalidimage",
-        "unschedulable",
-    ];
-    terminal_markers
-        .iter()
-        .any(|marker| haystack.contains(marker))
+
+    // These are transient conditions from the sandbox controller that indicate
+    // the sandbox is still being provisioned and may become ready:
+    //
+    // - ReconcilerError: Controller-level transient error, will be retried
+    // - DependenciesNotReady: Pod/Service not ready yet, normal during provisioning
+    //
+    // Any other Ready=False condition is considered terminal (e.g., the controller
+    // determined a permanent failure like ImagePullBackOff, Unschedulable, etc.)
+    let transient_reasons = ["reconcilererror", "dependenciesnotready"];
+
+    !transient_reasons.contains(&reason.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_condition(reason: &str, message: &str) -> SandboxCondition {
+        SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: reason.to_string(),
+            message: message.to_string(),
+            last_transition_time: String::new(),
+        }
+    }
+
+    #[test]
+    fn terminal_failure_treats_unknown_reasons_as_terminal() {
+        // Any Ready=False condition with an unknown reason is terminal.
+        // We trust the sandbox controller's assessment.
+        let terminal_cases = [
+            ("Failed", "Something went wrong"),
+            ("CrashLoopBackOff", "Container keeps crashing"),
+            ("ImagePullBackOff", "Failed to pull image"),
+            ("ErrImagePull", "Error pulling image"),
+            ("Unschedulable", "No nodes match"),
+            ("SomeOtherReason", "Any other reason is terminal"),
+        ];
+
+        for (reason, message) in terminal_cases {
+            let condition = make_condition(reason, message);
+            assert!(
+                is_terminal_failure_condition(&condition),
+                "Expected terminal failure for reason={reason}, message={message}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_failure_ignores_transient_reasons() {
+        // These reasons are transient - the sandbox may still become ready:
+        // - ReconcilerError: controller will retry
+        // - DependenciesNotReady: pod/service still being created
+        let transient_cases = [
+            (
+                "ReconcilerError",
+                "Error seen: failed to update pod: Operation cannot be fulfilled",
+            ),
+            ("reconcilererror", "lowercase also works"),
+            ("RECONCILERERROR", "uppercase also works"),
+            (
+                "DependenciesNotReady",
+                "Pod exists with phase: Pending; Service Exists",
+            ),
+            ("dependenciesnotready", "lowercase also works"),
+        ];
+
+        for (reason, message) in transient_cases {
+            let condition = make_condition(reason, message);
+            assert!(
+                !is_terminal_failure_condition(&condition),
+                "Expected transient (non-terminal) for reason={reason}, message={message}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_phase_returns_provisioning_for_transient_conditions() {
+        // Transient conditions (ReconcilerError, DependenciesNotReady) should
+        // result in Provisioning phase, not Error.
+        let transient_conditions = [
+            ("ReconcilerError", "Error seen: failed to update pod"),
+            (
+                "DependenciesNotReady",
+                "Pod exists with phase: Pending; Service Exists",
+            ),
+        ];
+
+        for (reason, message) in transient_conditions {
+            let status = Some(SandboxStatus {
+                sandbox_name: "test".to_string(),
+                agent_pod: "test-pod".to_string(),
+                agent_fd: String::new(),
+                sandbox_fd: String::new(),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: reason.to_string(),
+                    message: message.to_string(),
+                    last_transition_time: String::new(),
+                }],
+            });
+
+            assert_eq!(
+                derive_phase(&status, false),
+                SandboxPhase::Provisioning,
+                "Expected Provisioning for transient reason={reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_phase_returns_error_for_terminal_ready_false() {
+        let status = Some(SandboxStatus {
+            sandbox_name: "test".to_string(),
+            agent_pod: "test-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "ImagePullBackOff".to_string(),
+                message: "Failed to pull image".to_string(),
+                last_transition_time: String::new(),
+            }],
+        });
+
+        assert_eq!(derive_phase(&status, false), SandboxPhase::Error);
+    }
+
+    #[test]
+    fn derive_phase_returns_ready_for_ready_true() {
+        let status = Some(SandboxStatus {
+            sandbox_name: "test".to_string(),
+            agent_pod: "test-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Pod is Ready; Service Exists".to_string(),
+                last_transition_time: String::new(),
+            }],
+        });
+
+        assert_eq!(derive_phase(&status, false), SandboxPhase::Ready);
+    }
 }

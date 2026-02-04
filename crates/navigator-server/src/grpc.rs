@@ -169,7 +169,9 @@ impl Navigator for NavigatorService {
                     if stop_on_terminal {
                         let phase =
                             SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
-                        if matches!(phase, SandboxPhase::Ready | SandboxPhase::Error) {
+                        // Only stop on Ready - Error phase may be transient (e.g., ReconcilerError)
+                        // and the sandbox may recover. Let the client decide how to handle errors.
+                        if phase == SandboxPhase::Ready {
                             return;
                         }
                     }
@@ -234,7 +236,9 @@ impl Navigator for NavigatorService {
                                         }
                                         if stop_on_terminal {
                                             let phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
-                                            if matches!(phase, SandboxPhase::Ready | SandboxPhase::Error) {
+                                            // Only stop on Ready - Error phase may be transient (e.g., ReconcilerError)
+                                            // and the sandbox may recover. Let the client decide how to handle errors.
+                                            if phase == SandboxPhase::Ready {
                                                 return;
                                             }
                                         }

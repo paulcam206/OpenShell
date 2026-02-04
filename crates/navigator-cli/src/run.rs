@@ -12,7 +12,7 @@ use owo_colors::OwoColorize;
 use serde::Serialize;
 use std::io::IsTerminal;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -209,12 +209,41 @@ pub async fn sandbox_create(server: &str) -> Result<()> {
         .into_inner();
 
     let mut last_phase = sandbox.phase;
+    let mut last_error_reason = String::new();
+    let start_time = Instant::now();
+    let provision_timeout = Duration::from_secs(120);
 
     while let Some(item) = stream.next().await {
+        // Check for timeout
+        if start_time.elapsed() > provision_timeout {
+            if let Some(d) = display.as_mut() {
+                d.finish_phase(phase_name(last_phase));
+            }
+            println!();
+            return Err(miette::miette!(
+                "sandbox provisioning timed out after {:?}",
+                provision_timeout
+            ));
+        }
+
         let evt = item.into_diagnostic()?;
         match evt.payload {
             Some(navigator_core::proto::sandbox_stream_event::Payload::Sandbox(s)) => {
                 last_phase = s.phase;
+                // Capture error reason from conditions only when phase is Error
+                // to avoid showing stale transient error reasons
+                if SandboxPhase::try_from(s.phase) == Ok(SandboxPhase::Error)
+                    && let Some(status) = &s.status
+                {
+                    for condition in &status.conditions {
+                        if condition.r#type == "Ready"
+                            && condition.status.eq_ignore_ascii_case("false")
+                        {
+                            last_error_reason =
+                                format!("{}: {}", condition.reason, condition.message);
+                        }
+                    }
+                }
                 if let Some(d) = display.as_mut() {
                     d.set_phase(phase_name(s.phase));
                 } else {
@@ -260,9 +289,18 @@ pub async fn sandbox_create(server: &str) -> Result<()> {
 
     match SandboxPhase::try_from(last_phase) {
         Ok(SandboxPhase::Ready) => Ok(()),
-        Ok(SandboxPhase::Error) => Err(miette::miette!(
-            "sandbox entered error phase while provisioning"
-        )),
+        Ok(SandboxPhase::Error) => {
+            if last_error_reason.is_empty() {
+                Err(miette::miette!(
+                    "sandbox entered error phase while provisioning"
+                ))
+            } else {
+                Err(miette::miette!(
+                    "sandbox entered error phase while provisioning: {}",
+                    last_error_reason
+                ))
+            }
+        }
         _ => Err(miette::miette!(
             "sandbox provisioning stream ended before reaching terminal phase"
         )),
