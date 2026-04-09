@@ -211,8 +211,35 @@ impl ProcessHandle {
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
-        let mut cmd = Command::new(program);
-        cmd.args(args)
+        // On Windows, wrap the command through MXC's wxc-exec.exe for
+        // AppContainer sandboxing when the binary is available.
+        #[cfg(target_os = "windows")]
+        let (effective_program, effective_args, mxc_active) = {
+            if let Some(wxc_path) = sandbox::windows::find_wxc_exec() {
+                let config =
+                    sandbox::windows::translate_policy(program, args, policy, workdir);
+                let encoded = sandbox::windows::encode_config(&config);
+                debug!(
+                    wxc = %wxc_path.display(),
+                    "Wrapping process via MXC AppContainer"
+                );
+                (
+                    wxc_path.to_string_lossy().into_owned(),
+                    vec!["--config-base64".to_string(), encoded],
+                    true,
+                )
+            } else {
+                (program.to_string(), args.to_vec(), false)
+            }
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let (effective_program, effective_args, mxc_active) =
+            (program.to_string(), args.to_vec(), false);
+        let _ = mxc_active; // suppress unused on non-windows
+
+        let mut cmd = Command::new(&effective_program);
+        cmd.args(&effective_args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -222,6 +249,15 @@ impl ProcessHandle {
         scrub_sensitive_env(&mut cmd);
         inject_provider_env(&mut cmd, provider_env);
 
+        // When MXC is active on Windows, workdir is baked into the config.
+        // Otherwise, set it on the Command directly.
+        #[cfg(target_os = "windows")]
+        if !mxc_active {
+            if let Some(dir) = workdir {
+                cmd.current_dir(dir);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
         }

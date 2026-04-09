@@ -21,10 +21,12 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `grpc_client.rs` | gRPC client for fetching policy, provider environment, inference route bundles, policy polling/status reporting, proposal submission, and log push (`CachedOpenShellClient`) |
 | `denial_aggregator.rs` | `DenialAggregator` background task -- receives `DenialEvent`s from the proxy and bypass monitor, deduplicates by `(host, port, binary)`, drains on flush interval |
 | `mechanistic_mapper.rs` | Deterministic policy recommendation generator -- converts denial summaries to `PolicyChunk` proposals with confidence scores, rationale, and SSRF/private-IP detection |
-| `sandbox/mod.rs` | Platform abstraction -- dispatches to Linux or no-op |
+| `sandbox/mod.rs` | Platform abstraction -- dispatches to Linux, Windows (MXC), or no-op |
 | `sandbox/linux/mod.rs` | Linux composition: Landlock then seccomp |
 | `sandbox/linux/landlock.rs` | Filesystem isolation via Landlock LSM (ABI V1) |
 | `sandbox/linux/seccomp.rs` | Syscall filtering via BPF: socket domain blocks, dangerous syscall blocks, conditional flag blocks |
+| `sandbox/linux/netns.rs` | Network namespace creation, veth pair setup, bypass detection iptables rules, cleanup on drop |
+| `sandbox/windows.rs` | Windows sandbox via MXC AppContainer -- policy translation, wxc-exec binary discovery, config encoding |
 | `bypass_monitor.rs` | Background `/dev/kmsg` reader for iptables bypass detection events |
 | `sandbox/linux/netns.rs` | Network namespace creation, veth pair setup, bypass detection iptables rules, cleanup on drop |
 | `l7/mod.rs` | L7 types (`L7Protocol`, `TlsMode`, `EnforcementMode`, `L7EndpointConfig`), config parsing, validation, access preset expansion, deprecated `tls` value handling |
@@ -1275,11 +1277,14 @@ Wraps `tokio::process::Child` + PID. Platform-specific `spawn()` methods delegat
 - Proxy URLs: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (uppercase for curl/wget), `NO_PROXY=127.0.0.1,localhost,::1` for localhost bypass, `http_proxy`, `https_proxy`, `grpc_proxy` (lowercase for gRPC C-core), `no_proxy=127.0.0.1,localhost,::1`, `NODE_USE_ENV_PROXY=1` (required for Node.js built-in `fetch`/`http` clients to honor proxy env vars)
 - TLS trust store: `NODE_EXTRA_CA_CERTS` (standalone CA cert), `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (combined bundle)
 
-**Pre-exec closure** (runs in child after fork, before exec -- async-signal-safe):
+**Pre-exec closure** (runs in child after fork, before exec -- async-signal-safe, Linux only):
 1. `setpgid(0, 0)` if non-interactive (create new process group)
 2. `setns(fd, CLONE_NEWNET)` to enter network namespace (Linux only)
 3. `drop_privileges(policy)`: `initgroups()` -> `setgid()` -> `setuid()`
 4. `sandbox::apply(policy, workdir)`: Landlock then seccomp
+
+**MXC wrapping** (Windows only):
+On Windows, `spawn_impl()` wraps the target command through `wxc-exec.exe --config-base64 <encoded>` when the binary is available. The `SandboxPolicy` is translated to an MXC JSON config via `sandbox::windows::translate_policy()` and base64-encoded. The resulting `wxc-exec.exe` process creates an AppContainer, applies filesystem ACLs and network policy, then runs the original command inside it. If `wxc-exec.exe` is not found, the command spawns unsandboxed (existing fallback behavior).
 
 ### `drop_privileges()`
 
@@ -1708,18 +1713,44 @@ sequenceDiagram
 
 Platform-specific code is abstracted through `crates/openshell-sandbox/src/sandbox/mod.rs`.
 
-| Feature | Linux | Other platforms |
-|---------|-------|-----------------|
-| Landlock | Applied via `landlock` crate (ABI V1) | Warning + no-op |
-| Seccomp | Applied via `seccompiler` crate | No-op |
-| Network namespace | Full veth pair isolation | Not available |
-| Bypass detection | iptables rules + `/dev/kmsg` monitor | Not available (no netns) |
-| `/proc` identity binding | Full support | `evaluate_opa_tcp()` always denies |
-| Proxy | Functional (binds to veth IP or loopback) | Functional (loopback only, no identity binding) |
-| SSH server | Full support (with netns for shell processes) | Functional (no netns isolation for shell processes) |
-| Privilege dropping | `initgroups` + `setgid` + `setuid` | `setgid` + `setuid` (no `initgroups` on macOS) |
+| Feature | Linux | Windows (MXC) | Other platforms |
+|---------|-------|---------------|-----------------|
+| Filesystem isolation | Landlock LSM (ABI V2) | AppContainer ACLs via wxc-exec | Warning + no-op |
+| Syscall filtering | seccomp BPF | Not available (AppContainer provides process isolation) | No-op |
+| Network isolation | Network namespace (veth pair) | AppContainer capabilities + firewall rules | Not available |
+| Bypass detection | iptables rules + `/dev/kmsg` monitor | Not available | Not available (no netns) |
+| `/proc` identity binding | Full support | Not available | `evaluate_opa_tcp()` always denies |
+| Proxy | Functional (binds to veth IP or loopback) | Functional (MXC proxy config or loopback) | Functional (loopback only, no identity binding) |
+| SSH server | Full support (with netns for shell processes) | Not yet integrated with MXC | Functional (no netns isolation) |
+| Privilege dropping | `initgroups` + `setgid` + `setuid` | Not applicable (AppContainer SID-based) | `setgid` + `setuid` (no `initgroups` on macOS) |
 
-On non-Linux platforms, the sandbox can still run commands with proxy-based network filtering, but the kernel-level isolation (filesystem, syscall, namespace) and process-identity binding are unavailable.
+On Linux, the sandbox uses Landlock, seccomp, and network namespaces applied in a pre-exec closure.
+
+On Windows, the sandbox delegates to MXC's `wxc-exec.exe` which runs the child process inside an AppContainer. Policy is translated from OpenShell's `SandboxPolicy` to MXC's JSON config format at spawn time. If `wxc-exec.exe` is not found, the sandbox falls back to unsandboxed execution with an OCSF `DetectionFinding` event at `High` severity.
+
+On other platforms (macOS), the sandbox can still run commands with proxy-based network filtering, but kernel-level isolation and process-identity binding are unavailable.
+
+### Windows MXC Integration
+
+The Windows sandbox backend wraps process execution through MXC's `wxc-exec.exe --config-base64` interface. This is handled in `ProcessHandle::spawn()` (not `sandbox::apply()`) because AppContainer containment is applied at process creation time, not to a running process.
+
+**Binary discovery** (`sandbox::windows::find_wxc_exec()`):
+1. `OPENSHELL_WXC_EXEC_PATH` environment variable
+2. `wxc-exec.exe` on system `PATH`
+3. Well-known build paths under `MXC_REPO_PATH`
+
+**Policy mapping** (`sandbox::windows::translate_policy()`):
+
+| OpenShell | MXC Config |
+|-----------|------------|
+| `filesystem.read_only` | `filesystem.readonlyPaths` |
+| `filesystem.read_write` | `filesystem.readwritePaths` |
+| `filesystem.include_workdir` | Adds workdir to `readwritePaths` |
+| `network.mode = Block` | `network.defaultPolicy = "block"`, no capabilities |
+| `network.mode = Proxy` | `network.defaultPolicy = "block"`, proxy config, `internetClient` capability |
+| `network.mode = Allow` | `network.defaultPolicy = "allow"`, full capabilities |
+| `landlock` | Not applicable (Linux kernel-specific) |
+| `process.run_as_user` | Not applicable (AppContainer SID-based isolation) |
 
 ## Cross-References
 
